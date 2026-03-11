@@ -1,0 +1,7 @@
+torch
+pytorch-geometric
+esm
+biopython
+scikit-learn
+pandas
+tqdm
