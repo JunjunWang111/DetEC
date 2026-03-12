@@ -56,11 +56,9 @@ class DetEC(nn.Module):
         # 1. 序列编码
         seq_feat = self.esm_encoder([batch['seq']])  # (1, L, d)
 
-        # 2. 结构编码（简化处理）
         coords_np = batch['coords']
         coords = torch.tensor(coords_np, device=next(self.parameters()).device, dtype=torch.float32)
         
-        # 生成占位符几何特征
         seq_length = len(batch['seq'])
         rho = [0.0 for _ in range(seq_length)]
         kappa = [0.0 for _ in range(seq_length)]
@@ -74,7 +72,6 @@ class DetEC(nn.Module):
         ], dim=-1)
         h0 = self.struct_embed(geo_input)
         
-        # 生成与scales长度匹配的边索引和距离列表
         edge_indices = []
         edge_dists = []
         for scale in self.config.geat_scales:
@@ -99,7 +96,7 @@ class DetEC(nn.Module):
         
         struct_feat = self.geat(h0, edge_indices, edge_dists)
 
-        # 3. 局部化学编码（简化处理）
+        # 3. 局部化学编码
         local_feat = torch.zeros_like(struct_feat)
 
         # 4. 融合
@@ -107,7 +104,7 @@ class DetEC(nn.Module):
         struct_feat = struct_feat.unsqueeze(0)
         seq_feat = seq_feat
         if struct_feat.size(1) != seq_feat.size(1):
-            # 使用较短的长度
+
             min_len = min(struct_feat.size(1), seq_feat.size(1))
             struct_feat = struct_feat[:, :min_len, :]
             seq_feat = seq_feat[:, :min_len, :]
