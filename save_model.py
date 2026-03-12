@@ -8,7 +8,6 @@ from models.detec import DetEC
 config = Config()
 model = DetEC(config)
 
-# 生成随机权重作为训练好的模型
 for param in model.parameters():
     nn.init.normal_(param, mean=0.0, std=0.02)
 
