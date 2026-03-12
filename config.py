@@ -38,7 +38,7 @@ class Config:
     decoder_heads = 8
 
     # Hierarchy
-    ec_levels = [7, 7, 7, 7]
+    ec_levels = [7, 20, 100, 400]
 
     # ---------- 训练参数 ----------
     batch_size = 8
