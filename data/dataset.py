@@ -30,29 +30,24 @@ class ProteinDataset(Dataset):
         entry = row['Entry']
         ec_labels = row['EC number'].split(';')  # 处理多个EC号的情况
         sequence = row['Sequence']
-        
-        # 转换EC号为标签（这里简化处理，实际可能需要更复杂的编码）
-        # 提取主EC号（第一个）并转换为层级结构
+    
         main_ec = ec_labels[0]
         ec_parts = main_ec.split('.')
         while len(ec_parts) < 4:
             ec_parts.append('0')
         
-        # 为模型添加必要的字段（由于没有结构信息，使用占位符）
-        # 生成随机坐标作为占位符
         seq_length = len(sequence)
-        coords = [[0.0, 0.0, 0.0] for _ in range(seq_length)]  # 随机坐标
+        coords = [[0.0, 0.0, 0.0] for _ in range(seq_length)]  
         
-        # 构建样本
         sample = {
             'entry': entry,
-            'seq': sequence,  # 模型期望的字段名
+            'seq': sequence, 
             'sequence': sequence,
             'ec_labels': ec_labels,
             'ec_parts': ec_parts,
-            'coords': coords,  # 添加坐标信息
-            'structure': None,  # 结构信息（无）
-            'active_indices': []  # 活性位点索引（无）
+            'coords': coords, 
+            'structure': None, 
+            'active_indices': []  
         }
         
         return sample
