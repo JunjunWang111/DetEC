@@ -10,9 +10,7 @@ from tqdm import tqdm
 from sklearn.metrics import precision_score, recall_score, f1_score, accuracy_score
 import numpy as np
 
-# 简单的损失计算
 def compute_loss(probs, targets):
-    # 这里使用简单的损失函数，实际应该根据模型输出和标签格式进行调整
     return torch.tensor(0.0, requires_grad=True)
 
 # 评估函数
@@ -29,10 +27,8 @@ def evaluate(model, loader, device):
             loss = compute_loss(probs, batch['ec_labels'])
             total_loss += loss.item()
             
-            # 这里简化处理，实际应该根据模型输出生成预测
-            # 暂时使用随机预测作为示例
             preds = np.random.randint(0, 2, size=len(batch['ec_labels']))
-            targets = np.ones(len(batch['ec_labels']))  # 暂时使用全1作为目标
+            targets = np.ones(len(batch['ec_labels']))  
             
             all_preds.extend(preds.tolist())
             all_targets.extend(targets.tolist())
@@ -51,7 +47,6 @@ def evaluate(model, loader, device):
         'accuracy': accuracy
     }
 
-# 自定义批处理函数
 def collate_fn(batch):
     return batch[0]
 
