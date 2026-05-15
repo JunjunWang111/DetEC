@@ -1,154 +1,250 @@
-# train.py
+import argparse
+import json
+import math
+import os
+import random
+
+import numpy as np
 import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader
-from config import Config
-from data.dataset import ProteinDataset
-from models.detec import DetEC
-import os
 from tqdm import tqdm
-from sklearn.metrics import precision_score, recall_score, f1_score, accuracy_score
-import numpy as np
 
-def compute_loss(probs, targets):
-    return torch.tensor(0.0, requires_grad=True)
+from config import Config
+from data.dataset import ProteinDataset, collate_protein_batch, load_split_dataframe
+from models.detec import DetEC
+from utils.losses import compute_set_prediction_loss
+from utils.metrics import compute_multilabel_metrics, decode_prediction_sets
+from utils.protein import parse_ec_numbers
+from utils.taxonomy import ECTaxonomy
 
-# 评估函数
-def evaluate(model, loader, device):
+
+def set_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def build_taxonomy(config):
+    train_df = load_split_dataframe(config, "train")
+    ec_collections = [parse_ec_numbers(value) for value in train_df["EC number"].tolist()]
+    return ECTaxonomy.from_ec_collections(ec_collections)
+
+
+def to_device(batch, device):
+    moved = {}
+    for key, value in batch.items():
+        if torch.is_tensor(value):
+            moved[key] = value.to(device)
+        else:
+            moved[key] = value
+    return moved
+
+
+def build_scheduler(optimizer, steps_per_epoch, config):
+    total_steps = max(steps_per_epoch * config.epochs, 1)
+    warmup_steps = min(5000, max(1, total_steps // 10))
+
+    def lr_lambda(current_step):
+        if current_step < warmup_steps:
+            return float(current_step + 1) / float(max(1, warmup_steps))
+        progress = (current_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+
+def evaluate(model, loader, device, taxonomy, threshold):
     model.eval()
-    total_loss = 0
-    all_preds = []
-    all_targets = []
-    
+    total_loss = 0.0
+    all_predictions = []
+    all_truths = []
+
     with torch.no_grad():
         for batch in loader:
-            batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
-            probs = model(batch)
-            loss = compute_loss(probs, batch['ec_labels'])
-            total_loss += loss.item()
-            
-            preds = np.random.randint(0, 2, size=len(batch['ec_labels']))
-            targets = np.ones(len(batch['ec_labels']))  
-            
-            all_preds.extend(preds.tolist())
-            all_targets.extend(targets.tolist())
-    
-    # 计算评估指标
-    precision = precision_score(all_targets, all_preds, average='macro')
-    recall = recall_score(all_targets, all_preds, average='macro')
-    f1 = f1_score(all_targets, all_preds, average='macro')
-    accuracy = accuracy_score(all_targets, all_preds)
-    
-    return {
-        'loss': total_loss / len(loader),
-        'precision': precision,
-        'recall': recall,
-        'f1': f1,
-        'accuracy': accuracy
-    }
+            batch = to_device(batch, device)
+            outputs = model(batch)
+            loss = compute_set_prediction_loss(outputs, batch["known_targets"], taxonomy)
+            total_loss += float(loss.item())
 
-def collate_fn(batch):
-    return batch[0]
+            prediction_sets = decode_prediction_sets(outputs, taxonomy, threshold=threshold)
+            all_predictions.extend(prediction_sets)
+            all_truths.extend(batch["true_ecs"])
 
-# 测试函数
-def test(model, test_loader, device, test_name):
-    print(f"Testing on {test_name}...")
-    metrics = evaluate(model, test_loader, device)
-    print(f"{test_name} Results:")
-    print(f"Precision: {metrics['precision']:.4f}")
-    print(f"Recall: {metrics['recall']:.4f}")
-    print(f"F1 Score: {metrics['f1']:.4f}")
-    print(f"Accuracy: {metrics['accuracy']:.4f}")
-    print()
+    metrics = compute_multilabel_metrics(all_predictions, all_truths, label_space=taxonomy.full_labels)
+    metrics["loss"] = total_loss / max(len(loader), 1)
     return metrics
 
+
+def build_dataloaders(config, taxonomy):
+    train_dataset = ProteinDataset(config, split="train", taxonomy=taxonomy, max_samples=config.max_train_samples)
+    val_dataset = ProteinDataset(config, split="val", taxonomy=taxonomy, max_samples=config.max_val_samples)
+    test_new_dataset = ProteinDataset(config, split="test_new", taxonomy=taxonomy, max_samples=config.max_test_samples)
+    test_price_dataset = ProteinDataset(
+        config, split="test_price", taxonomy=taxonomy, max_samples=config.max_test_samples
+    )
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=config.batch_size,
+        shuffle=True,
+        num_workers=config.num_workers,
+        collate_fn=collate_protein_batch,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=config.batch_size,
+        shuffle=False,
+        num_workers=config.num_workers,
+        collate_fn=collate_protein_batch,
+    )
+    test_new_loader = DataLoader(
+        test_new_dataset,
+        batch_size=config.batch_size,
+        shuffle=False,
+        num_workers=config.num_workers,
+        collate_fn=collate_protein_batch,
+    )
+    test_price_loader = DataLoader(
+        test_price_dataset,
+        batch_size=config.batch_size,
+        shuffle=False,
+        num_workers=config.num_workers,
+        collate_fn=collate_protein_batch,
+    )
+    return train_loader, val_loader, test_new_loader, test_price_loader
+
+
+def save_checkpoint(model, taxonomy, config, path):
+    payload = {
+        "model_state": model.state_dict(),
+        "taxonomy": taxonomy.to_dict(),
+        "config": config.__dict__,
+    }
+    torch.save(payload, path)
+
+
+def print_metrics(prefix, metrics):
+    print(f"{prefix} loss: {metrics['loss']:.4f}")
+    print(f"{prefix} precision: {metrics['precision']:.4f}")
+    print(f"{prefix} recall: {metrics['recall']:.4f}")
+    print(f"{prefix} f1: {metrics['f1']:.4f}")
+    print(f"{prefix} accuracy: {metrics['accuracy']:.4f}")
+    print()
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train DetEC with a runnable approximation of the paper pipeline.")
+    parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument("--batch_size", type=int, default=None)
+    parser.add_argument("--lr", type=float, default=None)
+    parser.add_argument("--weight_decay", type=float, default=None)
+    parser.add_argument("--device", type=str, default=None)
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--num_workers", type=int, default=None)
+    parser.add_argument("--max_train_samples", type=int, default=None)
+    parser.add_argument("--max_val_samples", type=int, default=None)
+    parser.add_argument("--max_test_samples", type=int, default=None)
+    parser.add_argument("--objectness_threshold", type=float, default=None)
+    parser.add_argument("--use_pretrained_esm", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--freeze_pretrained_esm", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--esm_model_name", type=str, default=None)
+    parser.add_argument("--local_atom_radius", type=float, default=None)
+    parser.add_argument("--use_p2rank_active_sites", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--java_path", type=str, default=None)
+    parser.add_argument("--p2rank_root", type=str, default=None)
+    parser.add_argument("--p2rank_probability_threshold", type=float, default=None)
+    parser.add_argument("--p2rank_top_pockets", type=int, default=None)
+    parser.add_argument("--allow_download", action="store_true")
+    return parser.parse_args()
+
+
 def train():
+    args = parse_args()
     config = Config()
+    config.apply_overrides(args)
+    if args.allow_download:
+        config.allow_download = True
+
+    set_seed(config.seed)
     device = torch.device(config.device)
-
-    # 创建数据目录
-    os.makedirs(os.path.join(config.data_root, config.pdb_dir), exist_ok=True)
-
-    # 加载数据集
-    train_dataset = ProteinDataset(config, split='train')
-    val_dataset = ProteinDataset(config, split='val')
-    test_new_dataset = ProteinDataset(config, split='test_new')
-    test_price_dataset = ProteinDataset(config, split='test_price')
-
-    train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True,
-                              num_workers=config.num_workers, collate_fn=collate_fn)
-    val_loader = DataLoader(val_dataset, batch_size=config.batch_size, shuffle=False,
-                            num_workers=config.num_workers, collate_fn=collate_fn)
-    test_new_loader = DataLoader(test_new_dataset, batch_size=config.batch_size, shuffle=False,
-                               num_workers=config.num_workers, collate_fn=collate_fn)
-    test_price_loader = DataLoader(test_price_dataset, batch_size=config.batch_size, shuffle=False,
-                                 num_workers=config.num_workers, collate_fn=collate_fn)
-
-    # 初始化模型
-    model = DetEC(config).to(device)
-    optimizer = optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10)
-
-    # 创建保存目录
     os.makedirs(config.save_dir, exist_ok=True)
 
-    best_f1 = 0.0
-    for epoch in range(1, config.epochs+1):
+    taxonomy = build_taxonomy(config)
+    train_loader, val_loader, test_new_loader, test_price_loader = build_dataloaders(config, taxonomy)
+
+    model = DetEC(config, taxonomy).to(device)
+    optimizer = optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
+    scheduler = build_scheduler(optimizer, steps_per_epoch=max(len(train_loader), 1), config=config)
+
+    best_f1 = -1.0
+    patience_counter = 0
+
+    for epoch in range(1, config.epochs + 1):
         model.train()
-        total_loss = 0
-        for batch in tqdm(train_loader, desc=f'Epoch {epoch}'):
-            batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
-            probs = model(batch)
-            loss = compute_loss(probs, batch['ec_labels'])
+        running_loss = 0.0
+        progress_bar = tqdm(train_loader, desc=f"Epoch {epoch}/{config.epochs}")
+        for batch in progress_bar:
+            batch = to_device(batch, device)
+            outputs = model(batch)
+            loss = compute_set_prediction_loss(outputs, batch["known_targets"], taxonomy)
+
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
-            total_loss += loss.item()
+            scheduler.step()
 
-        avg_loss = total_loss / len(train_loader)
-        print(f'Epoch {epoch} train loss: {avg_loss:.4f}')
+            running_loss += float(loss.item())
+            progress_bar.set_postfix(loss=f"{loss.item():.4f}")
 
-        # 验证
-        val_metrics = evaluate(model, val_loader, device)
-        print(f'Val Results:')
-        print(f'Precision: {val_metrics["precision"]:.4f}')
-        print(f'Recall: {val_metrics["recall"]:.4f}')
-        print(f'F1 Score: {val_metrics["f1"]:.4f}')
-        print(f'Accuracy: {val_metrics["accuracy"]:.4f}')
-        print()
+        avg_train_loss = running_loss / max(len(train_loader), 1)
+        print(f"Epoch {epoch} train loss: {avg_train_loss:.4f}")
 
-        scheduler.step(val_metrics['loss'])
+        val_metrics = evaluate(model, val_loader, device, taxonomy, threshold=config.objectness_threshold)
+        print_metrics("Val", val_metrics)
 
-        # 每次epoch都保存模型
-        torch.save(model.state_dict(), os.path.join(config.save_dir, f'model_epoch_{epoch}.pt'))
-        
-        if val_metrics['f1'] > best_f1:
-            best_f1 = val_metrics['f1']
-            torch.save(model.state_dict(), os.path.join(config.save_dir, 'best_model.pt'))
-    
-    # 测试模型
-    print("=" * 50)
-    print("Testing best model...")
-    print("=" * 50)
-    
-    # 加载最佳模型
-    best_model = DetEC(config).to(device)
-    best_model.load_state_dict(torch.load(os.path.join(config.save_dir, 'best_model.pt')))
-    
-    # 测试New-392.csv
-    new_metrics = test(best_model, test_new_loader, device, 'New-392')
-    
-    # 测试Price-149.csv
-    price_metrics = test(best_model, test_price_loader, device, 'Price-149')
-    
-    # 生成评估报告
-    print("=" * 50)
-    print("Final Evaluation Report")
-    print("=" * 50)
-    print(f"{'Dataset':<10} {'Precision':<10} {'Recall':<10} {'F1 Score':<10} {'Accuracy':<10}")
-    print(f"{'New-392':<10} {new_metrics['precision']:.4f}      {new_metrics['recall']:.4f}      {new_metrics['f1']:.4f}      {new_metrics['accuracy']:.4f}")
-    print(f"{'Price-149':<10} {price_metrics['precision']:.4f}      {price_metrics['recall']:.4f}      {price_metrics['f1']:.4f}      {price_metrics['accuracy']:.4f}")
+        latest_path = os.path.join(config.save_dir, "latest_model.pt")
+        save_checkpoint(model, taxonomy, config, latest_path)
 
-if __name__ == '__main__':
+        if val_metrics["f1"] > best_f1:
+            best_f1 = val_metrics["f1"]
+            patience_counter = 0
+            save_checkpoint(model, taxonomy, config, os.path.join(config.save_dir, "best_model.pt"))
+        else:
+            patience_counter += 1
+            if patience_counter >= config.patience:
+                print(f"Early stopping triggered at epoch {epoch}.")
+                break
+
+    checkpoint = torch.load(os.path.join(config.save_dir, "best_model.pt"), map_location=device)
+    model.load_state_dict(checkpoint["model_state"])
+
+    print("=" * 60)
+    print("Testing best model")
+    print("=" * 60)
+    new_metrics = evaluate(model, test_new_loader, device, taxonomy, threshold=config.objectness_threshold)
+    price_metrics = evaluate(model, test_price_loader, device, taxonomy, threshold=config.objectness_threshold)
+
+    print_metrics("New-392", new_metrics)
+    print_metrics("Price-149", price_metrics)
+
+    report = (
+        "==================================================\n"
+        "Final Evaluation Report\n"
+        "==================================================\n"
+        "Dataset    Precision  Recall     F1 Score   Accuracy\n"
+        f"New-392    {new_metrics['precision']:.4f}      {new_metrics['recall']:.4f}      {new_metrics['f1']:.4f}      {new_metrics['accuracy']:.4f}\n"
+        f"Price-149  {price_metrics['precision']:.4f}      {price_metrics['recall']:.4f}      {price_metrics['f1']:.4f}      {price_metrics['accuracy']:.4f}\n"
+        "==================================================\n"
+    )
+
+    report_path = os.path.join(os.getcwd(), "evaluation_results.txt")
+    with open(report_path, "w", encoding="utf-8") as handle:
+        handle.write(report)
+    print(report)
+
+
+if __name__ == "__main__":
     train()

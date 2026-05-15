@@ -1,21 +1,32 @@
-# save_model.py
+import os
+
 import torch
 import torch.nn as nn
+
 from config import Config
+from data.dataset import load_split_dataframe
 from models.detec import DetEC
+from utils.protein import parse_ec_numbers
+from utils.taxonomy import ECTaxonomy
 
-# 初始化配置和模型
+
 config = Config()
-model = DetEC(config)
+train_df = load_split_dataframe(config, "train")
+taxonomy = ECTaxonomy.from_ec_collections(parse_ec_numbers(value) for value in train_df["EC number"].tolist())
+model = DetEC(config, taxonomy)
 
-for param in model.parameters():
-    nn.init.normal_(param, mean=0.0, std=0.02)
+for parameter in model.parameters():
+    nn.init.normal_(parameter, mean=0.0, std=0.02)
 
-# 保存模型
-model_path = './checkpoints/best_model.pt'
-import os
-os.makedirs('./checkpoints', exist_ok=True)
-torch.save(model.state_dict(), model_path)
+checkpoint_path = "./checkpoints/best_model.pt"
+os.makedirs("./checkpoints", exist_ok=True)
+torch.save(
+    {
+        "model_state": model.state_dict(),
+        "taxonomy": taxonomy.to_dict(),
+        "config": config.__dict__,
+    },
+    checkpoint_path,
+)
 
-print(f"训练好的模型已保存到: {model_path}")
-print("模型保存完成！")
+print(f"Initialized checkpoint saved to: {checkpoint_path}")
