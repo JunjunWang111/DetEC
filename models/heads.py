@@ -1,18 +1,22 @@
-# models/heads.py
 import torch
 import torch.nn as nn
 
+
 class HierarchicalHead(nn.Module):
-    def __init__(self, d_model, ec_levels):
+    def __init__(self, d_model, level_sizes, full_ec_size):
         super().__init__()
-        self.ec_levels = ec_levels
-        self.mlp1 = nn.Linear(d_model, ec_levels[0])
-        self.mlp2 = nn.Linear(d_model + ec_levels[0], ec_levels[1])
-        self.mlp3 = nn.Linear(d_model + ec_levels[0] + ec_levels[1], ec_levels[2])
-        self.mlp4 = nn.Linear(d_model + ec_levels[0] + ec_levels[1] + ec_levels[2], ec_levels[3])
+        self.level_sizes = level_sizes
+        self.full_ec_size = full_ec_size
+
+        self.objectness = nn.Linear(d_model, 1)
+        self.mlp1 = nn.Linear(d_model, level_sizes[0])
+        self.mlp2 = nn.Linear(d_model + level_sizes[0], level_sizes[1])
+        self.mlp3 = nn.Linear(d_model + level_sizes[0] + level_sizes[1], level_sizes[2])
+        self.mlp4 = nn.Linear(d_model + level_sizes[0] + level_sizes[1] + level_sizes[2], full_ec_size)
 
     def forward(self, q):
-        B, K, d = q.shape
+        logits_obj = self.objectness(q).squeeze(-1)
+
         logits1 = self.mlp1(q)
         probs1 = torch.softmax(logits1, dim=-1)
 
@@ -26,6 +30,11 @@ class HierarchicalHead(nn.Module):
 
         inp4 = torch.cat([q, probs1, probs2, probs3], dim=-1)
         logits4 = self.mlp4(inp4)
-        probs4 = torch.sigmoid(logits4)
 
-        return probs1, probs2, probs3, probs4
+        return {
+            "objectness": logits_obj,
+            "level1": logits1,
+            "level2": logits2,
+            "level3": logits3,
+            "level4": logits4,
+        }
