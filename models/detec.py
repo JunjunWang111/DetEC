@@ -1,123 +1,104 @@
-# models/detec.py
-import torch
 import torch.nn as nn
-from .geat import GEAT
-from .esm_encoder import ESMEncoder
-from .schnet import SchNetEncoder
-from .fusion import BiDirectionalCrossAttention, QueryGuidedFusion
-from .decoder import FunctionQueryDecoder
-from .heads import HierarchicalHead
-from utils.geometry import compute_local_density, compute_curvature, compute_local_frames
+
+from models.decoder import FunctionQueryDecoder
+from models.esm_encoder import ESMEncoder
+from models.fusion import BiDirectionalCrossAttention, QueryGuidedFusion
+from models.geat import GEAT
+from models.heads import HierarchicalHead
+from models.schnet import SchNetEncoder
+from utils.protein import build_local_atom_edges, build_scale_edges
+
 
 class DetEC(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, taxonomy):
         super().__init__()
         self.config = config
+        self.taxonomy = taxonomy
 
-        # 序列编码
-        self.esm_encoder = ESMEncoder(config.esm_model_name, config.d_model)
+        self.esm_encoder = ESMEncoder(
+            config.esm_model_name,
+            config.d_model,
+            max_length=config.max_seq_len,
+            num_layers=config.seq_encoder_layers,
+            num_heads=config.seq_encoder_heads,
+            ffn_dim=config.seq_encoder_ffn,
+            dropout=config.dropout,
+            use_pretrained=config.use_pretrained_esm,
+            freeze_pretrained=config.freeze_pretrained_esm,
+            cache_dir=config.esm_cache_dir,
+        )
 
-        # 全局结构编码 (GEAT)
+        self.struct_embed = nn.Linear(14, config.d_model)
         self.geat = GEAT(
             in_dim=config.d_model,
             d_model=config.d_model,
             num_heads=config.num_heads,
             scales=config.geat_scales,
             scale_weights=config.geat_weights,
-            dropout=config.dropout
+            dropout=config.dropout,
         )
-        self.struct_embed = nn.Linear(3 + 1 + 1 + 9, config.d_model)
 
-        # 局部化学编码 (SchNet)
+        local_input_dim = config.atom_feature_dim
         self.schnet = SchNetEncoder(
-            atom_feat_dim=4,
+            atom_feat_dim=local_input_dim,
             hidden_dim=config.d_model,
             n_filters=config.schnet_n_filters,
-            n_interactions=config.schnet_n_interactions
+            n_interactions=config.schnet_n_interactions,
         )
 
-        # 融合
         self.bi_attn = BiDirectionalCrossAttention(config.d_model, config.num_heads, config.fusion_dropout)
         self.query_fusion = QueryGuidedFusion(config.d_model, config.num_heads, config.fusion_dropout)
-
-        # 解码器
         self.decoder = FunctionQueryDecoder(
             num_queries=config.num_queries,
             d_model=config.d_model,
             num_layers=config.decoder_layers,
             num_heads=config.decoder_heads,
-            dropout=config.dropout
+            dropout=config.dropout,
         )
+        self.hier_head = HierarchicalHead(config.d_model, taxonomy.level_sizes, taxonomy.num_full_ecs)
 
-        # 层次预测头
-        self.hier_head = HierarchicalHead(config.d_model, config.ec_levels)
+    def _encode_structure(self, coords, geometry):
+        h0 = self.struct_embed(geometry)
+        edge_indices, edge_dists = build_scale_edges(
+            coords,
+            scales=self.config.geat_scales,
+            knn=self.config.geat_knn,
+            geometry=geometry,
+        )
+        return self.geat(h0, edge_indices, edge_dists)
+
+    def _encode_local_environment(self, atom_features, atom_coords, atom_residue_ids, sequence_length):
+        edge_index, edge_rbf = build_local_atom_edges(
+            coords=atom_coords,
+            cutoff=self.config.schnet_cutoff,
+            n_rbf=self.config.schnet_rbf_centers,
+        )
+        atom_embeddings = self.schnet(atom_features, edge_index, edge_rbf)
+        residue_embeddings = atom_embeddings.new_zeros(sequence_length, atom_embeddings.size(-1))
+        counts = atom_embeddings.new_zeros(sequence_length, 1)
+        residue_embeddings.index_add_(0, atom_residue_ids, atom_embeddings)
+        counts.index_add_(0, atom_residue_ids, torch.ones_like(atom_embeddings[:, :1]))
+        return residue_embeddings / counts.clamp_min(1.0)
 
     def forward(self, batch):
-        # 1. 序列编码
-        seq_feat = self.esm_encoder([batch['seq']])  # (1, L, d)
+        seq_feat = self.esm_encoder(batch["token_ids"], batch["padding_mask"], sequences=batch["sequences"])
+        outputs = []
 
-        coords_np = batch['coords']
-        coords = torch.tensor(coords_np, device=next(self.parameters()).device, dtype=torch.float32)
-        
-        seq_length = len(batch['seq'])
-        rho = [0.0 for _ in range(seq_length)]
-        kappa = [0.0 for _ in range(seq_length)]
-        frames = [[0.0 for _ in range(9)] for _ in range(seq_length)]
-        
-        geo_input = torch.cat([
-            coords,
-            torch.tensor(rho, device=coords.device, dtype=torch.float32).unsqueeze(-1),
-            torch.tensor(kappa, device=coords.device, dtype=torch.float32).unsqueeze(-1),
-            torch.tensor(frames, device=coords.device, dtype=torch.float32)
-        ], dim=-1)
-        h0 = self.struct_embed(geo_input)
-        
-        edge_indices = []
-        edge_dists = []
-        for scale in self.config.geat_scales:
-            # 为每个尺度生成边索引和距离
-            if seq_length > 1:
-                # 生成相邻残基的边
-                edges = []
-                dists = []
-                for i in range(seq_length - 1):
-                    edges.append([i, i+1])
-                    edges.append([i+1, i])
-                    dists.append(scale)
-                    dists.append(scale)
-                edge_index = torch.tensor(edges, device=coords.device).t()
-                edge_dist = torch.tensor(dists, device=coords.device)
-            else:
-                # 单个残基的情况
-                edge_index = torch.empty((2, 0), device=coords.device, dtype=torch.long)
-                edge_dist = torch.empty(0, device=coords.device)
-            edge_indices.append(edge_index)
-            edge_dists.append(edge_dist)
-        
-        struct_feat = self.geat(h0, edge_indices, edge_dists)
+        for batch_index, length in enumerate(batch["lengths"]):
+            coords = batch["coords"][batch_index, :length]
+            geometry = batch["geometry"][batch_index, :length]
+            atom_features = batch["local_atom_features"][batch_index].to(coords.device)
+            atom_coords = batch["local_atom_coords"][batch_index].to(coords.device)
+            atom_residue_ids = batch["local_atom_residue_ids"][batch_index].to(coords.device)
 
-        # 3. 局部化学编码
-        local_feat = torch.zeros_like(struct_feat)
+            struct_feat = self._encode_structure(coords, geometry)
+            local_feat = self._encode_local_environment(atom_features, atom_coords, atom_residue_ids, length)
+            seq_sample = seq_feat[batch_index, :length]
 
-        # 4. 融合
-        # 处理长度不匹配的情况
-        struct_feat = struct_feat.unsqueeze(0)
-        seq_feat = seq_feat
-        if struct_feat.size(1) != seq_feat.size(1):
+            global_feat = self.bi_attn(struct_feat.unsqueeze(0), seq_sample.unsqueeze(0)).squeeze(0)
+            fused_feat = self.query_fusion(global_feat.unsqueeze(0), local_feat.unsqueeze(0))
+            queries = self.decoder(fused_feat)
+            outputs.append(self.hier_head(queries))
 
-            min_len = min(struct_feat.size(1), seq_feat.size(1))
-            struct_feat = struct_feat[:, :min_len, :]
-            seq_feat = seq_feat[:, :min_len, :]
-        H_global = self.bi_attn(struct_feat, seq_feat)
-        H_global = H_global.squeeze(0)
-        local_feat = local_feat[:H_global.size(0), :]
-        H_fused = self.query_fusion(H_global.unsqueeze(0), local_feat.unsqueeze(0)).squeeze(0)
+        return {key: torch.cat([item[key] for item in outputs], dim=0) for key in outputs[0]}
 
-        # 5. 解码
-        memory = H_fused.unsqueeze(0)
-        queries = self.decoder(memory)
-
-        # 6. 层次预测
-        probs = self.hier_head(queries)
-
-        return probs
